@@ -8,11 +8,30 @@ function json(data) {
   return new Response(JSON.stringify(data), { headers: cors });
 }
 
-function decode(value) {
+function encodeId(value) {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function decodeId(value) {
+  const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = base64 + "=".repeat((4 - base64.length % 4) % 4);
+  const binary = atob(padded);
+  const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+function validUrl(value) {
   try {
-    return decodeURIComponent(value);
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
   } catch {
-    return value;
+    return false;
   }
 }
 
@@ -25,13 +44,12 @@ export default {
       return new Response(null, { headers: cors });
     }
 
-    // Addon manifest
     if (path === "/manifest.json") {
       return json({
         id: "com.nuvio.directplayer",
-        version: "1.0.1",
+        version: "1.0.2",
         name: "Direct Video Player",
-        description: "Play direct video links",
+        description: "Play your own direct video links",
         resources: ["catalog", "meta", "stream"],
         types: ["movie"],
         idPrefixes: ["direct:"],
@@ -47,60 +65,83 @@ export default {
       });
     }
 
-    // Search catalog
-    if (path.startsWith("/catalog/movie/direct")) {
-      const input = url.searchParams.get("search") || "";
+    // Search: /catalog/movie/direct/search=<encoded URL>.json
+    if (path.startsWith("/catalog/movie/direct/")) {
+      const extra = path.slice("/catalog/movie/direct/".length)
+        .replace(/\.json$/, "");
 
-      if (!/^https?:\/\//i.test(input)) {
+      const params = new URLSearchParams(extra);
+      const input = params.get("search") || "";
+
+      if (!validUrl(input)) {
         return json({ metas: [] });
       }
 
-      const id = "direct:" + encodeURIComponent(input);
+      const id = "direct:" + encodeId(input);
 
       return json({
         metas: [{
           id,
           type: "movie",
           name: "Direct Video",
-          description: "Custom video link"
+          description: input
         }]
       });
     }
 
     // Metadata
     if (path.startsWith("/meta/movie/")) {
-      const encodedId = path.split("/").pop().replace(".json", "");
-      const id = decode(encodedId);
+      const itemId = path.split("/").pop().replace(/\.json$/, "");
+
+      if (!itemId.startsWith("direct:")) {
+        return json({ meta: null });
+      }
+
+      let videoUrl;
+      try {
+        videoUrl = decodeId(itemId.slice("direct:".length));
+      } catch {
+        return json({ meta: null });
+      }
 
       return json({
         meta: {
-          id,
+          id: itemId,
           type: "movie",
           name: "Direct Video",
+          description: videoUrl,
           videos: [{
-            id,
+            id: itemId,
             title: "Play Video"
           }]
         }
       });
     }
 
-    // Video stream
+    // Stream
     if (path.startsWith("/stream/movie/")) {
-      const encodedId = path.split("/").pop().replace(".json", "");
-      const id = decode(encodedId);
+      const itemId = path.split("/").pop().replace(/\.json$/, "");
 
-      const video = decode(id.slice("direct:".length));
+      if (!itemId.startsWith("direct:")) {
+        return json({ streams: [] });
+      }
 
-      if (!/^https?:\/\//i.test(video)) {
+      let videoUrl;
+      try {
+        videoUrl = decodeId(itemId.slice("direct:".length));
+      } catch {
+        return json({ streams: [] });
+      }
+
+      if (!validUrl(videoUrl)) {
         return json({ streams: [] });
       }
 
       return json({
         streams: [{
-          name: "Direct Video",
+          name: "Direct Video Player",
           title: "Play Video",
-          url: video,
+          url: videoUrl,
           behaviorHints: {
             notWebReady: false
           }
