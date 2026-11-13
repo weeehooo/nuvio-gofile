@@ -84,6 +84,7 @@ function parseFilename(filename) {
 
   let season = null;
   let episode = null;
+  let absoluteEpisode = null;
   let title = name;
 
   let match = name.match(/\bS(\d{1,2})\s*E(\d{1,3})\b/i);
@@ -106,6 +107,19 @@ function parseFilename(filename) {
         season = Number(match[1]);
         episode = Number(match[2]);
         title = name.slice(0, match.index).trim();
+      } else {
+        // Absolute anime episode number, e.g. One Piece - 1180
+        // Avoid treating short numbers and years as episode numbers.
+        match = name.match(/(?:^|[\s._-])[-._ ]*(\d{3,4})\s*$/);
+
+        if (match) {
+          const number = Number(match[1]);
+
+          if (number >= 100 && number <= 9999) {
+            absoluteEpisode = number;
+            title = name.slice(0, match.index).trim();
+          }
+        }
       }
     }
   }
@@ -118,13 +132,18 @@ function parseFilename(filename) {
   return {
     title: title || name || "Direct Video",
     season,
-    episode
+    episode,
+    absoluteEpisode
   };
 }
 
 function displayTitle(title, info) {
   if (info.season !== null && info.episode !== null) {
     return `${title} - S${String(info.season).padStart(2, "0")}E${String(info.episode).padStart(2, "0")}`;
+  }
+
+  if (info.absoluteEpisode !== null) {
+    return `${title} - ${info.absoluteEpisode}`;
   }
 
   return title;
@@ -156,8 +175,6 @@ async function tmdbFetch(endpoint, token) {
   }
 }
 
-// TMDB search uses English to identify the correct work.
-// Details and episode metadata are requested in Arabic.
 async function fetchTMDBSeries(title, info, token) {
   const key = `tmdb-series:${title}:${info.season}:${info.episode}`;
 
@@ -323,7 +340,7 @@ async function fetchAnime(title) {
 }
 
 async function fetchSeries(title, info) {
-  const key = `series:${title}:${info.season}:${info.episode}`;
+  const key = `series:${title}:${info.season}:${info.episode}:${info.absoluteEpisode}`;
 
   if (cache.has(key)) return cache.get(key);
 
@@ -367,6 +384,14 @@ async function fetchSeries(title, info) {
       );
     }
 
+    // Match an absolute anime episode number when Cinemeta has it.
+    if (!episode && info.absoluteEpisode !== null) {
+      episode = (series.videos || []).find(video =>
+        Number(video.episode) === info.absoluteEpisode ||
+        Number(video.number) === info.absoluteEpisode
+      );
+    }
+
     const result = {
       name: series.name || title,
       poster: series.poster || undefined,
@@ -376,7 +401,16 @@ async function fetchSeries(title, info) {
       genres: series.genres || [],
       episodeName: episode?.title || null,
       episodeDescription: episode?.overview || null,
-      episodeReleased: episode?.released || null
+      episodeReleased: episode?.released || null,
+
+      // Keep the actual season/episode mapping if available.
+      mappedSeason: episode?.season != null
+        ? Number(episode.season)
+        : null,
+
+      mappedEpisode: episode?.episode != null
+        ? Number(episode.episode)
+        : null
     };
 
     cache.set(key, result);
@@ -437,9 +471,33 @@ async function getMetadata(videoUrl, token) {
   const anime = await fetchAnime(info.title);
 
   if (anime) {
+    let tmdbInfo = info;
+
+    // For absolute episode numbers, try to find the season/episode
+    // mapping through Cinemeta before querying TMDB.
+    if (
+      info.absoluteEpisode !== null &&
+      (info.season === null || info.episode === null)
+    ) {
+      const mapping = await fetchSeries(anime.name, info);
+
+      if (
+        mapping?.mappedSeason !== null &&
+        mapping?.mappedSeason !== undefined &&
+        mapping?.mappedEpisode !== null &&
+        mapping?.mappedEpisode !== undefined
+      ) {
+        tmdbInfo = {
+          ...info,
+          season: mapping.mappedSeason,
+          episode: mapping.mappedEpisode
+        };
+      }
+    }
+
     const tmdb = await fetchTMDBSeries(
       anime.name,
-      info,
+      tmdbInfo,
       token
     );
 
@@ -451,7 +509,7 @@ async function getMetadata(videoUrl, token) {
         ? `${anime.name} - ${episodeName}`
         : displayTitle(anime.name, info),
 
-      // Always keep anime artwork from AniList.
+      // Anime artwork always comes from AniList.
       poster: anime.poster,
       background: anime.background,
 
@@ -473,9 +531,23 @@ async function getMetadata(videoUrl, token) {
   const series = await fetchSeries(info.title, info);
 
   if (series) {
+    let tmdbInfo = info;
+
+    if (
+      info.absoluteEpisode !== null &&
+      series.mappedSeason !== null &&
+      series.mappedEpisode !== null
+    ) {
+      tmdbInfo = {
+        ...info,
+        season: series.mappedSeason,
+        episode: series.mappedEpisode
+      };
+    }
+
     const tmdb = await fetchTMDBSeries(
       info.title,
-      info,
+      tmdbInfo,
       token
     );
 
@@ -494,7 +566,6 @@ async function getMetadata(videoUrl, token) {
         ? `${series.name} - ${episodeName}`
         : displayTitle(series.name, info),
 
-      // Keep original series artwork.
       poster: series.poster,
       background: series.background,
 
@@ -570,7 +641,7 @@ export default {
     if (path === "/manifest.json") {
       return json({
         id: "com.nuvio.directplayer",
-        version: "1.0.9",
+        version: "1.1.0",
         name: "Nuvio Stream",
         description: "Play direct video links with automatic metadata",
         resources: ["catalog", "meta", "stream"],
