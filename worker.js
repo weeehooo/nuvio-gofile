@@ -10,6 +10,8 @@ const TMDB_LANGUAGE = "ar-SA";
 const TMDB_SEARCH_LANGUAGE = "en-US";
 const TMDB_IMAGE = "https://image.tmdb.org/t/p/original";
 
+const ARABIC_FALLBACK = "لا يتوفر وصف عربي لهذا العمل حاليًا.";
+
 function json(data) {
   return new Response(JSON.stringify(data), { headers: cors });
 }
@@ -73,14 +75,54 @@ function exactMatch(a, b) {
   return first.length > 0 && first === second;
 }
 
+function titleMatchScore(input, candidate) {
+  const a = normalize(input);
+  const b = normalize(candidate);
+
+  if (!a || !b) return 0;
+  if (a === b) return 100;
+
+  if (a.length >= 4 && b.length >= 4) {
+    if (a.includes(b) || b.includes(a)) return 85;
+  }
+
+  const wordsA = (input || "")
+    .toLowerCase()
+    .split(/[\s._-]+/)
+    .filter(Boolean);
+
+  const wordsB = (candidate || "")
+    .toLowerCase()
+    .split(/[\s._-]+/)
+    .filter(Boolean);
+
+  if (!wordsA.length || !wordsB.length) return 0;
+
+  const matched = wordsA.filter(word =>
+    wordsB.some(other =>
+      normalize(word) === normalize(other)
+    )
+  ).length;
+
+  return Math.round(
+    (matched / Math.max(wordsA.length, wordsB.length)) * 75
+  );
+}
+
+function cleanFilenameTitle(value) {
+  return (value || "")
+    .replace(/^\[[^\]]+\]\s*/, "")
+    .replace(/\[[^\]]*\]/g, " ")
+    .replace(/\([^)]*(?:1080p|720p|2160p|480p|4k|8k|web|bluray|hevc|x265|x264)[^)]*\)/gi, " ")
+    .replace(/\b(2160p|1080p|720p|480p|4k|8k|WEB-DL|WEBRip|WEB|BluRay|BDRip|BRRip|HEVC|H265|H264|x265|x264|AAC|DTS|10bit|HDR|NF|AMZN|DSNP|CR|ATVP)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^[\s._-]+|[\s._-]+$/g, "")
+    .trim();
+}
+
 function parseFilename(filename) {
   let name = filename.replace(/\.[^.]+$/, "");
-
-  name = name
-    .replace(/\[[^\]]*\]/g, " ")
-    .replace(/\b(2160p|1080p|720p|480p|4k|8k|WEB-DL|WEBRip|BluRay|BDRip|HEVC|H265|H264|x265|x264|AAC|DTS|10bit|HDR)\b/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  name = cleanFilenameTitle(name);
 
   let season = null;
   let episode = null;
@@ -108,16 +150,21 @@ function parseFilename(filename) {
         episode = Number(match[2]);
         title = name.slice(0, match.index).trim();
       } else {
-        // Absolute anime episode number, e.g. One Piece - 1180
-        // Avoid treating short numbers and years as episode numbers.
-        match = name.match(/(?:^|[\s._-])[-._ ]*(\d{3,4})\s*$/);
+        match = name.match(/(?:^|[\s._-])[-._ ]*(\d{1,4})(?:v\d+)?\s*$/i);
 
         if (match) {
           const number = Number(match[1]);
+          const before = name.slice(0, match.index).trim();
 
-          if (number >= 100 && number <= 9999) {
+          const isLikelyEpisode =
+            number >= 1 &&
+            number <= 9999 &&
+            before.length >= 2 &&
+            !(number >= 1900 && number <= 2099 && match[1].length === 4);
+
+          if (isLikelyEpisode) {
             absoluteEpisode = number;
-            title = name.slice(0, match.index).trim();
+            title = before;
           }
         }
       }
@@ -127,6 +174,7 @@ function parseFilename(filename) {
   title = title
     .replace(/[-_. ]+$/, "")
     .replace(/[._]/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 
   return {
@@ -151,6 +199,60 @@ function displayTitle(title, info) {
 
 function tmdbImage(path) {
   return path ? `${TMDB_IMAGE}${path}` : undefined;
+}
+
+// Translate descriptions only. Never translate titles or episode names.
+async function translateArabic(text) {
+  if (!text || !text.trim()) return ARABIC_FALLBACK;
+
+  // Already Arabic with no English letters.
+  const hasArabic = /[\u0600-\u06FF]/.test(text);
+  const hasEnglish = /[A-Za-z]/.test(text);
+
+  if (hasArabic && !hasEnglish) return text;
+
+  try {
+    const chunks = text.match(/[\s\S]{1,4000}/g) || [];
+    const translated = [];
+
+    for (const chunk of chunks) {
+      const url =
+        "https://translate.googleapis.com/translate_a/single" +
+        "?client=gtx&sl=auto&tl=ar&dt=t&q=" +
+        encodeURIComponent(chunk);
+
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(10000)
+      });
+
+      if (!response.ok) {
+        throw new Error("Translation failed");
+      }
+
+      const data = await response.json();
+
+      const result = (data[0] || [])
+        .map(part => part[0] || "")
+        .join("");
+
+      if (!result.trim()) {
+        throw new Error("Empty translation");
+      }
+
+      translated.push(result);
+    }
+
+    const output = translated.join("").trim();
+
+    if (!/[\u0600-\u06FF]/.test(output)) {
+      return ARABIC_FALLBACK;
+    }
+
+    return output;
+  } catch {
+    // Do not expose English descriptions if translation fails.
+    return hasArabic ? text : ARABIC_FALLBACK;
+  }
 }
 
 async function tmdbFetch(endpoint, token) {
@@ -269,6 +371,7 @@ async function fetchTMDBMovie(title, token) {
   return result;
 }
 
+// AniList: English, Romaji, Japanese and alternate titles.
 async function fetchAnime(title) {
   const key = "anime:" + title;
 
@@ -276,13 +379,14 @@ async function fetchAnime(title) {
 
   const query = `
     query ($search: String) {
-      Page(perPage: 10) {
+      Page(perPage: 25) {
         media(search: $search, type: ANIME) {
           title {
             romaji
             english
             native
           }
+          synonyms
           description(asHtml: false)
           coverImage {
             extraLarge
@@ -307,7 +411,7 @@ async function fetchAnime(title) {
         query,
         variables: { search: title }
       }),
-      signal: AbortSignal.timeout(6000)
+      signal: AbortSignal.timeout(10000)
     });
 
     if (!response.ok) return null;
@@ -315,21 +419,57 @@ async function fetchAnime(title) {
     const data = await response.json();
     const results = data?.data?.Page?.media || [];
 
-    const match = results.find(item =>
-      exactMatch(title, item.title.english) ||
-      exactMatch(title, item.title.romaji) ||
-      exactMatch(title, item.title.native)
-    );
+    let bestMatch = null;
+    let bestScore = 0;
 
-    if (!match) return null;
+    for (const item of results) {
+      const titles = [
+        item.title?.english,
+        item.title?.romaji,
+        item.title?.native,
+        ...(item.synonyms || [])
+      ].filter(Boolean);
+
+      let score = 0;
+
+      for (const candidate of titles) {
+        score = Math.max(
+          score,
+          titleMatchScore(title, candidate)
+        );
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = item;
+      }
+    }
+
+    if (!bestMatch || bestScore < 65) return null;
 
     const result = {
-      name: match.title.english || match.title.romaji || title,
-      poster: match.coverImage?.extraLarge || match.coverImage?.large,
-      background: match.bannerImage || undefined,
-      description: match.description || "",
-      releaseInfo: match.seasonYear ? String(match.seasonYear) : undefined,
-      genres: match.genres || []
+      name:
+        bestMatch.title?.english ||
+        bestMatch.title?.romaji ||
+        title,
+
+      poster:
+        bestMatch.coverImage?.extraLarge ||
+        bestMatch.coverImage?.large,
+
+      background:
+        bestMatch.bannerImage || undefined,
+
+      description:
+        bestMatch.description || "",
+
+      releaseInfo:
+        bestMatch.seasonYear
+          ? String(bestMatch.seasonYear)
+          : undefined,
+
+      genres:
+        bestMatch.genres || []
     };
 
     cache.set(key, result);
@@ -357,7 +497,9 @@ async function fetchSeries(title, info) {
     const searchData = await searchResponse.json();
     const metas = searchData?.metas || [];
 
-    const match = metas.find(item => exactMatch(title, item.name));
+    const match = metas.find(item =>
+      exactMatch(title, item.name)
+    );
 
     if (!match) return null;
 
@@ -384,7 +526,6 @@ async function fetchSeries(title, info) {
       );
     }
 
-    // Match an absolute anime episode number when Cinemeta has it.
     if (!episode && info.absoluteEpisode !== null) {
       episode = (series.videos || []).find(video =>
         Number(video.episode) === info.absoluteEpisode ||
@@ -403,7 +544,6 @@ async function fetchSeries(title, info) {
       episodeDescription: episode?.overview || null,
       episodeReleased: episode?.released || null,
 
-      // Keep the actual season/episode mapping if available.
       mappedSeason: episode?.season != null
         ? Number(episode.season)
         : null,
@@ -438,7 +578,9 @@ async function fetchMovie(title) {
     const data = await response.json();
     const metas = data?.metas || [];
 
-    const match = metas.find(item => exactMatch(title, item.name));
+    const match = metas.find(item =>
+      exactMatch(title, item.name)
+    );
 
     if (!match) return null;
 
@@ -458,23 +600,21 @@ async function fetchMovie(title) {
   }
 }
 
-async function getMetadata(videoUrl, token) {
+async function getMetadataRaw(videoUrl, token) {
   const filename = getFilename(videoUrl);
   const info = parseFilename(filename);
 
   const fallback = {
     name: displayTitle(info.title, info),
-    description: `Original file: ${filename}`
+    description: ""
   };
 
-  // 1. Anime: AniList owns the title and artwork.
+  // 1. Anime: AniList owns anime artwork.
   const anime = await fetchAnime(info.title);
 
   if (anime) {
     let tmdbInfo = info;
 
-    // For absolute episode numbers, try to find the season/episode
-    // mapping through Cinemeta before querying TMDB.
     if (
       info.absoluteEpisode !== null &&
       (info.season === null || info.episode === null)
@@ -501,15 +641,13 @@ async function getMetadata(videoUrl, token) {
       token
     );
 
-    const episodeName =
-      tmdb?.episodeName || null;
+    const episodeName = tmdb?.episodeName || null;
 
     return {
       name: episodeName
         ? `${anime.name} - ${episodeName}`
         : displayTitle(anime.name, info),
 
-      // Anime artwork always comes from AniList.
       poster: anime.poster,
       background: anime.background,
 
@@ -517,7 +655,7 @@ async function getMetadata(videoUrl, token) {
         tmdb?.episodeDescription ||
         tmdb?.description ||
         anime.description ||
-        fallback.description,
+        "",
 
       releaseInfo:
         tmdb?.episodeReleased?.slice(0, 4) ||
@@ -527,7 +665,7 @@ async function getMetadata(videoUrl, token) {
     };
   }
 
-  // 2. TV series: Cinemeta owns English title and artwork.
+  // 2. TV series: Cinemeta owns series artwork.
   const series = await fetchSeries(info.title, info);
 
   if (series) {
@@ -573,7 +711,7 @@ async function getMetadata(videoUrl, token) {
         episodeDescription ||
         tmdb?.description ||
         series.description ||
-        fallback.description,
+        "",
 
       releaseInfo:
         tmdb?.episodeReleased?.slice(0, 4) ||
@@ -604,7 +742,7 @@ async function getMetadata(videoUrl, token) {
       description:
         tmdbSeries.episodeDescription ||
         tmdbSeries.description ||
-        fallback.description,
+        "",
 
       releaseInfo:
         tmdbSeries.episodeReleased?.slice(0, 4) ||
@@ -626,6 +764,17 @@ async function getMetadata(videoUrl, token) {
   return fallback;
 }
 
+// Translate descriptions only. Names remain unchanged.
+async function getMetadata(videoUrl, token) {
+  const metadata = await getMetadataRaw(videoUrl, token);
+
+  metadata.description = await translateArabic(
+    metadata.description
+  );
+
+  return metadata;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -641,7 +790,7 @@ export default {
     if (path === "/manifest.json") {
       return json({
         id: "com.nuvio.directplayer",
-        version: "1.1.0",
+        version: "1.2.1",
         name: "Nuvio Stream",
         description: "Play direct video links with automatic metadata",
         resources: ["catalog", "meta", "stream"],
