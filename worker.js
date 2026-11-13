@@ -5,7 +5,9 @@ const cors = {
 };
 
 const cache = new Map();
+
 const TMDB_LANGUAGE = "ar-SA";
+const TMDB_SEARCH_LANGUAGE = "en-US";
 const TMDB_IMAGE = "https://image.tmdb.org/t/p/original";
 
 function json(data) {
@@ -59,9 +61,9 @@ function getFilename(videoUrl) {
 
 function normalize(value) {
   return (value || "")
-    .normalize("NFKC")
-    .toLowerCase()
+    .normalize("NFKD")
     .replace(/\p{M}/gu, "")
+    .toLowerCase()
     .replace(/[^\p{L}\p{N}]/gu, "");
 }
 
@@ -128,6 +130,10 @@ function displayTitle(title, info) {
   return title;
 }
 
+function tmdbImage(path) {
+  return path ? `${TMDB_IMAGE}${path}` : undefined;
+}
+
 async function tmdbFetch(endpoint, token) {
   if (!token) return null;
 
@@ -150,17 +156,15 @@ async function tmdbFetch(endpoint, token) {
   }
 }
 
-function tmdbImage(path) {
-  return path ? `${TMDB_IMAGE}${path}` : undefined;
-}
-
+// TMDB search uses English to identify the correct work.
+// Details and episode metadata are requested in Arabic.
 async function fetchTMDBSeries(title, info, token) {
   const key = `tmdb-series:${title}:${info.season}:${info.episode}`;
 
   if (cache.has(key)) return cache.get(key);
 
   const search = await tmdbFetch(
-    `/search/tv?query=${encodeURIComponent(title)}&language=${TMDB_LANGUAGE}&include_adult=false`,
+    `/search/tv?query=${encodeURIComponent(title)}&language=${TMDB_SEARCH_LANGUAGE}&include_adult=false`,
     token
   );
 
@@ -190,17 +194,17 @@ async function fetchTMDBSeries(title, info, token) {
   }
 
   const result = {
-    name: details.name || match.name || title,
+    name: match.original_name || match.name || title,
     poster: tmdbImage(details.poster_path || match.poster_path),
     background: tmdbImage(details.backdrop_path || match.backdrop_path),
     description: details.overview || match.overview || "",
+    episodeName: episode?.name || null,
+    episodeDescription: episode?.overview || null,
+    episodeReleased: episode?.air_date || null,
     releaseInfo: details.first_air_date
       ? details.first_air_date.slice(0, 4)
       : undefined,
-    genres: (details.genres || []).map(g => g.name),
-    episodeName: episode?.name || null,
-    episodeDescription: episode?.overview || null,
-    episodeReleased: episode?.air_date || null
+    genres: (details.genres || []).map(g => g.name)
   };
 
   cache.set(key, result);
@@ -213,7 +217,7 @@ async function fetchTMDBMovie(title, token) {
   if (cache.has(key)) return cache.get(key);
 
   const search = await tmdbFetch(
-    `/search/movie?query=${encodeURIComponent(title)}&language=${TMDB_LANGUAGE}&include_adult=false`,
+    `/search/movie?query=${encodeURIComponent(title)}&language=${TMDB_SEARCH_LANGUAGE}&include_adult=false`,
     token
   );
 
@@ -234,7 +238,7 @@ async function fetchTMDBMovie(title, token) {
   if (!details) return null;
 
   const result = {
-    name: details.title || match.title || title,
+    name: match.original_title || match.title || title,
     poster: tmdbImage(details.poster_path || match.poster_path),
     background: tmdbImage(details.backdrop_path || match.backdrop_path),
     description: details.overview || match.overview || "",
@@ -250,6 +254,7 @@ async function fetchTMDBMovie(title, token) {
 
 async function fetchAnime(title) {
   const key = "anime:" + title;
+
   if (cache.has(key)) return cache.get(key);
 
   const query = `
@@ -319,6 +324,7 @@ async function fetchAnime(title) {
 
 async function fetchSeries(title, info) {
   const key = `series:${title}:${info.season}:${info.episode}`;
+
   if (cache.has(key)) return cache.get(key);
 
   try {
@@ -370,7 +376,6 @@ async function fetchSeries(title, info) {
       genres: series.genres || [],
       episodeName: episode?.title || null,
       episodeDescription: episode?.overview || null,
-      episodeImage: episode?.thumbnail || null,
       episodeReleased: episode?.released || null
     };
 
@@ -383,6 +388,7 @@ async function fetchSeries(title, info) {
 
 async function fetchMovie(title) {
   const key = "movie:" + title;
+
   if (cache.has(key)) return cache.get(key);
 
   try {
@@ -427,75 +433,121 @@ async function getMetadata(videoUrl, token) {
     description: `Original file: ${filename}`
   };
 
-  // Arabic TV and anime metadata from TMDB
-  const tmdbSeries = await fetchTMDBSeries(info.title, info, token);
+  // 1. Anime: AniList owns the title and artwork.
+  const anime = await fetchAnime(info.title);
 
-  if (tmdbSeries) {
-    const hasEpisode = Boolean(tmdbSeries.episodeName);
+  if (anime) {
+    const tmdb = await fetchTMDBSeries(
+      anime.name,
+      info,
+      token
+    );
+
+    const episodeName =
+      tmdb?.episodeName || null;
 
     return {
-      name: hasEpisode
-        ? `${tmdbSeries.name} - ${tmdbSeries.episodeName}`
+      name: episodeName
+        ? `${anime.name} - ${episodeName}`
+        : displayTitle(anime.name, info),
+
+      // Always keep anime artwork from AniList.
+      poster: anime.poster,
+      background: anime.background,
+
+      description:
+        tmdb?.episodeDescription ||
+        tmdb?.description ||
+        anime.description ||
+        fallback.description,
+
+      releaseInfo:
+        tmdb?.episodeReleased?.slice(0, 4) ||
+        anime.releaseInfo,
+
+      genres: anime.genres || []
+    };
+  }
+
+  // 2. TV series: Cinemeta owns English title and artwork.
+  const series = await fetchSeries(info.title, info);
+
+  if (series) {
+    const tmdb = await fetchTMDBSeries(
+      info.title,
+      info,
+      token
+    );
+
+    const episodeName =
+      tmdb?.episodeName ||
+      series.episodeName ||
+      null;
+
+    const episodeDescription =
+      tmdb?.episodeDescription ||
+      series.episodeDescription ||
+      null;
+
+    return {
+      name: episodeName
+        ? `${series.name} - ${episodeName}`
+        : displayTitle(series.name, info),
+
+      // Keep original series artwork.
+      poster: series.poster,
+      background: series.background,
+
+      description:
+        episodeDescription ||
+        tmdb?.description ||
+        series.description ||
+        fallback.description,
+
+      releaseInfo:
+        tmdb?.episodeReleased?.slice(0, 4) ||
+        series.releaseInfo,
+
+      genres: series.genres || tmdb?.genres || []
+    };
+  }
+
+  // 3. TMDB-only TV fallback.
+  const tmdbSeries = await fetchTMDBSeries(
+    info.title,
+    info,
+    token
+  );
+
+  if (tmdbSeries) {
+    const episodeName = tmdbSeries.episodeName;
+
+    return {
+      name: episodeName
+        ? `${tmdbSeries.name} - ${episodeName}`
         : displayTitle(tmdbSeries.name, info),
 
       poster: tmdbSeries.poster,
       background: tmdbSeries.background,
 
-      description: hasEpisode && tmdbSeries.episodeDescription
-        ? tmdbSeries.episodeDescription
-        : tmdbSeries.description || fallback.description,
+      description:
+        tmdbSeries.episodeDescription ||
+        tmdbSeries.description ||
+        fallback.description,
 
-      releaseInfo: tmdbSeries.episodeReleased
-        ? tmdbSeries.episodeReleased.slice(0, 4)
-        : tmdbSeries.releaseInfo,
+      releaseInfo:
+        tmdbSeries.episodeReleased?.slice(0, 4) ||
+        tmdbSeries.releaseInfo,
 
       genres: tmdbSeries.genres || []
     };
   }
 
-  // Original series metadata fallback
-  const series = await fetchSeries(info.title, info);
-
-  if (series) {
-    const hasEpisode = Boolean(series.episodeName);
-
-    return {
-      name: hasEpisode
-        ? `${series.name} - ${series.episodeName}`
-        : displayTitle(series.name, info),
-
-      poster: series.poster,
-      background: series.background,
-
-      description: hasEpisode && series.episodeDescription
-        ? series.episodeDescription
-        : series.description || fallback.description,
-
-      releaseInfo: series.episodeReleased
-        ? series.episodeReleased.slice(0, 4)
-        : series.releaseInfo,
-
-      genres: series.genres || []
-    };
-  }
-
-  // Anime fallback
-  const anime = await fetchAnime(info.title);
-
-  if (anime) {
-    return {
-      ...anime,
-      name: displayTitle(anime.name, info),
-      description: `${fallback.name}\n\n${anime.description}`
-    };
-  }
-
-  // Arabic movie metadata from TMDB
+  // 4. Movie metadata.
   const tmdbMovie = await fetchTMDBMovie(info.title, token);
 
   if (tmdbMovie) return tmdbMovie;
 
-  // Original movie metadata fallback
   const movie = await fetchMovie(info.title);
 
   if (movie) return movie;
@@ -518,16 +570,16 @@ export default {
     if (path === "/manifest.json") {
       return json({
         id: "com.nuvio.directplayer",
-        version: "1.0.8",
-        name: "Direct Video Player",
-        description: "تشغيل روابط الفيديو المباشرة مع بيانات عربية تلقائية",
+        version: "1.0.9",
+        name: "Nuvio Stream",
+        description: "Play direct video links with automatic metadata",
         resources: ["catalog", "meta", "stream"],
         types: ["movie"],
         idPrefixes: ["direct:"],
         catalogs: [{
           type: "movie",
           id: "direct",
-          name: "مشغل الفيديو المباشر",
+          name: "Nuvio Stream",
           extra: [{
             name: "search",
             isRequired: true
@@ -622,7 +674,7 @@ export default {
 
       return json({
         streams: [{
-          name: "Direct Video Player",
+          name: "Nuvio Stream",
           title: "Play Video",
           url: videoUrl,
           behaviorHints: {
