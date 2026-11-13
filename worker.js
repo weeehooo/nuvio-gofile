@@ -11,7 +11,10 @@ function json(data) {
 function encodeId(value) {
   const bytes = new TextEncoder().encode(value);
   let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
   return btoa(binary)
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
@@ -23,7 +26,16 @@ function decodeId(value) {
   const padded = base64 + "=".repeat((4 - base64.length % 4) % 4);
   const binary = atob(padded);
   const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+
   return new TextDecoder().decode(bytes);
+}
+
+function decodeItemId(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }
 
 function validUrl(value) {
@@ -44,10 +56,11 @@ export default {
       return new Response(null, { headers: cors });
     }
 
+    // Manifest
     if (path === "/manifest.json") {
       return json({
         id: "com.nuvio.directplayer",
-        version: "1.0.2",
+        version: "1.0.3",
         name: "Direct Video Player",
         description: "Play your own direct video links",
         resources: ["catalog", "meta", "stream"],
@@ -65,9 +78,10 @@ export default {
       });
     }
 
-    // Search: /catalog/movie/direct/search=<encoded URL>.json
+    // Catalog Search
     if (path.startsWith("/catalog/movie/direct/")) {
-      const extra = path.slice("/catalog/movie/direct/".length)
+      const extra = path
+        .slice("/catalog/movie/direct/".length)
         .replace(/\.json$/, "");
 
       const params = new URLSearchParams(extra);
@@ -91,16 +105,22 @@ export default {
 
     // Metadata
     if (path.startsWith("/meta/movie/")) {
-      const itemId = path.split("/").pop().replace(/\.json$/, "");
+      const rawId = path.split("/").pop().replace(/\.json$/, "");
+      const itemId = decodeItemId(rawId);
 
       if (!itemId.startsWith("direct:")) {
         return json({ meta: null });
       }
 
       let videoUrl;
+
       try {
         videoUrl = decodeId(itemId.slice("direct:".length));
       } catch {
+        return json({ meta: null });
+      }
+
+      if (!validUrl(videoUrl)) {
         return json({ meta: null });
       }
 
@@ -120,13 +140,15 @@ export default {
 
     // Stream
     if (path.startsWith("/stream/movie/")) {
-      const itemId = path.split("/").pop().replace(/\.json$/, "");
+      const rawId = path.split("/").pop().replace(/\.json$/, "");
+      const itemId = decodeItemId(rawId);
 
       if (!itemId.startsWith("direct:")) {
         return json({ streams: [] });
       }
 
       let videoUrl;
+
       try {
         videoUrl = decodeId(itemId.slice("direct:".length));
       } catch {
