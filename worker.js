@@ -4,8 +4,7 @@ const cors = {
   "Content-Type": "application/json; charset=utf-8"
 };
 
-const animeCache = new Map();
-const movieCache = new Map();
+const cache = new Map();
 
 function json(data) {
   return new Response(JSON.stringify(data), { headers: cors });
@@ -14,10 +13,7 @@ function json(data) {
 function encodeId(value) {
   const bytes = new TextEncoder().encode(value);
   let binary = "";
-
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
+  for (const byte of bytes) binary += String.fromCharCode(byte);
 
   return btoa(binary)
     .replace(/\+/g, "-")
@@ -30,7 +26,6 @@ function decodeId(value) {
   const padded = base64 + "=".repeat((4 - base64.length % 4) % 4);
   const binary = atob(padded);
   const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
-
   return new TextDecoder().decode(bytes);
 }
 
@@ -44,8 +39,8 @@ function decodeItemId(value) {
 
 function validUrl(value) {
   try {
-    const url = new URL(value);
-    return url.protocol === "http:" || url.protocol === "https:";
+    const u = new URL(value);
+    return u.protocol === "http:" || u.protocol === "https:";
   } catch {
     return false;
   }
@@ -53,11 +48,19 @@ function validUrl(value) {
 
 function getFilename(videoUrl) {
   try {
-    const url = new URL(videoUrl);
-    return decodeURIComponent(url.pathname.split("/").pop() || "");
+    const u = new URL(videoUrl);
+    return decodeURIComponent(u.pathname.split("/").pop() || "");
   } catch {
     return "Direct Video";
   }
+}
+
+function normalize(value) {
+  return (value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
 }
 
 function parseFilename(filename) {
@@ -65,7 +68,6 @@ function parseFilename(filename) {
 
   name = name
     .replace(/\[[^\]]*\]/g, " ")
-    .replace(/\([^)]*(?:1080p|720p|2160p|WEB-DL|BluRay)[^)]*\)/gi, " ")
     .replace(/\b(2160p|1080p|720p|480p|4k|8k|WEB-DL|WEBRip|BluRay|BDRip|HEVC|H265|H264|x265|x264|AAC|DTS|10bit|HDR)\b/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -110,35 +112,43 @@ function parseFilename(filename) {
   };
 }
 
-function formatTitle(info, original) {
+function displayTitle(title, info) {
   if (info.season !== null && info.episode !== null) {
-    return `${info.title} - S${String(info.season).padStart(2, "0")}E${String(info.episode).padStart(2, "0")}`;
+    return `${title} - S${String(info.season).padStart(2, "0")}E${String(info.episode).padStart(2, "0")}`;
   }
 
-  return info.title || original;
+  return title;
+}
+
+function exactMatch(info, title) {
+  const wanted = normalize(info);
+  const candidate = normalize(title);
+
+  return wanted.length > 0 && candidate === wanted;
 }
 
 async function fetchAnime(title) {
-  if (animeCache.has(title)) {
-    return animeCache.get(title);
-  }
+  const key = "anime:" + title;
+  if (cache.has(key)) return cache.get(key);
 
   const query = `
     query ($search: String) {
-      Media(search: $search, type: ANIME) {
-        title {
-          romaji
-          english
-          native
+      Page(perPage: 10) {
+        media(search: $search, type: ANIME) {
+          title {
+            romaji
+            english
+            native
+          }
+          description(asHtml: false)
+          coverImage {
+            extraLarge
+            large
+          }
+          bannerImage
+          seasonYear
+          genres
         }
-        description(asHtml: false)
-        coverImage {
-          extraLarge
-          large
-        }
-        bannerImage
-        seasonYear
-        genres
       }
     }
   `;
@@ -160,20 +170,26 @@ async function fetchAnime(title) {
     if (!response.ok) return null;
 
     const data = await response.json();
-    const media = data?.data?.Media;
+    const results = data?.data?.Page?.media || [];
 
-    if (!media) return null;
+    const match = results.find(item =>
+      exactMatch(title, item.title.english) ||
+      exactMatch(title, item.title.romaji) ||
+      exactMatch(title, item.title.native)
+    );
+
+    if (!match) return null;
 
     const result = {
-      name: media.title.english || media.title.romaji || title,
-      poster: media.coverImage.extraLarge || media.coverImage.large,
-      background: media.bannerImage || undefined,
-      description: media.description || "",
-      releaseInfo: media.seasonYear ? String(media.seasonYear) : undefined,
-      genres: media.genres || []
+      name: match.title.english || match.title.romaji || title,
+      poster: match.coverImage?.extraLarge || match.coverImage?.large,
+      background: match.bannerImage || undefined,
+      description: match.description || "",
+      releaseInfo: match.seasonYear ? String(match.seasonYear) : undefined,
+      genres: match.genres || []
     };
 
-    animeCache.set(title, result);
+    cache.set(key, result);
     return result;
   } catch {
     return null;
@@ -182,16 +198,13 @@ async function fetchAnime(title) {
 
 async function fetchCinemeta(title, type) {
   const key = `${type}:${title}`;
-
-  if (movieCache.has(key)) {
-    return movieCache.get(key);
-  }
+  if (cache.has(key)) return cache.get(key);
 
   try {
-    const url =
+    const endpoint =
       `https://v3-cinemeta.strem.io/catalog/${type}/top/search=${encodeURIComponent(title)}.json`;
 
-    const response = await fetch(url, {
+    const response = await fetch(endpoint, {
       signal: AbortSignal.timeout(6000)
     });
 
@@ -200,36 +213,22 @@ async function fetchCinemeta(title, type) {
     const data = await response.json();
     const metas = data?.metas || [];
 
-    if (!metas.length) return null;
-
-    const normalize = value =>
-      (value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-
-    const wanted = normalize(title);
-
-    let best = metas.find(item =>
-      normalize(item.name) === wanted
+    const match = metas.find(item =>
+      exactMatch(title, item.name)
     );
 
-    if (!best) {
-      best = metas.find(item =>
-        normalize(item.name).includes(wanted) ||
-        wanted.includes(normalize(item.name))
-      );
-    }
-
-    if (!best) best = metas[0];
+    if (!match) return null;
 
     const result = {
-      name: best.name || title,
-      poster: best.poster || undefined,
-      background: best.background || undefined,
-      description: best.description || "",
-      releaseInfo: best.releaseInfo || undefined,
-      genres: best.genres || []
+      name: match.name,
+      poster: match.poster || undefined,
+      background: match.background || undefined,
+      description: match.description || "",
+      releaseInfo: match.releaseInfo || undefined,
+      genres: match.genres || []
     };
 
-    movieCache.set(key, result);
+    cache.set(key, result);
     return result;
   } catch {
     return null;
@@ -241,47 +240,44 @@ async function getMetadata(videoUrl) {
   const info = parseFilename(filename);
 
   const fallback = {
-    name: formatTitle(info, filename),
+    name: displayTitle(info.title, info),
     description: `Original file: ${filename}`
   };
 
-  // Try anime database first
+  // Anime lookup
   const anime = await fetchAnime(info.title);
 
   if (anime) {
     return {
-      ...fallback,
       ...anime,
-      name: formatTitle({
-        ...info,
-        title: anime.name
-      }, filename),
-      description:
-        `${fallback.name}\n\n${anime.description || ""}`
+      name: displayTitle(anime.name, info),
+      description: `${fallback.name}\n\n${anime.description}`
     };
   }
 
-  // Try movie database
-  const movie = await fetchCinemeta(info.title, "movie");
-
-  // Try TV series database
+  // TV series lookup
   const series = await fetchCinemeta(info.title, "series");
 
-  const result = movie || series;
-
-  if (result) {
+  if (series) {
     return {
-      ...fallback,
-      ...result,
-      name: formatTitle({
-        ...info,
-        title: result.name
-      }, filename),
-      description:
-        `${fallback.name}\n\n${result.description || ""}`
+      ...series,
+      name: displayTitle(series.name, info),
+      description: `${fallback.name}\n\n${series.description}`
     };
   }
 
+  // Movie lookup
+  const movie = await fetchCinemeta(info.title, "movie");
+
+  if (movie) {
+    return {
+      ...movie,
+      name: movie.name,
+      description: movie.description
+    };
+  }
+
+  // No reliable match: use original filename
   return fallback;
 }
 
@@ -298,7 +294,7 @@ export default {
     if (path === "/manifest.json") {
       return json({
         id: "com.nuvio.directplayer",
-        version: "1.0.4",
+        version: "1.0.5",
         name: "Direct Video Player",
         description: "Play direct video links with automatic metadata",
         resources: ["catalog", "meta", "stream"],
@@ -316,7 +312,7 @@ export default {
       });
     }
 
-    // Catalog Search
+    // Catalog
     if (path.startsWith("/catalog/movie/direct/")) {
       const extra = path
         .slice("/catalog/movie/direct/".length)
@@ -325,20 +321,16 @@ export default {
       const params = new URLSearchParams(extra);
       const input = params.get("search") || "";
 
-      if (!validUrl(input)) {
-        return json({ metas: [] });
-      }
+      if (!validUrl(input)) return json({ metas: [] });
 
       const id = "direct:" + encodeId(input);
-      const filename = getFilename(input);
-      const info = parseFilename(filename);
       const metadata = await getMetadata(input);
 
       return json({
         metas: [{
           id,
           type: "movie",
-          name: metadata.name || info.title,
+          name: metadata.name,
           poster: metadata.poster,
           background: metadata.background,
           description: metadata.description
@@ -363,9 +355,7 @@ export default {
         return json({ meta: null });
       }
 
-      if (!validUrl(videoUrl)) {
-        return json({ meta: null });
-      }
+      if (!validUrl(videoUrl)) return json({ meta: null });
 
       const metadata = await getMetadata(videoUrl);
 
@@ -404,9 +394,7 @@ export default {
         return json({ streams: [] });
       }
 
-      if (!validUrl(videoUrl)) {
-        return json({ streams: [] });
-      }
+      if (!validUrl(videoUrl)) return json({ streams: [] });
 
       return json({
         streams: [{
