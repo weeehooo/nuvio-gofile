@@ -316,7 +316,8 @@ async function getMetadata(videoUrl) {
         ? `${series.name} - ${series.episodeName}`
         : displayTitle(series.name, info),
 
-      poster: series.episodeImage || series.poster,
+      // Always use the series poster, not the episode thumbnail.
+      poster: series.poster,
       background: series.background,
 
       description: hasEpisode && series.episodeDescription
@@ -363,7 +364,7 @@ export default {
     if (path === "/manifest.json") {
       return json({
         id: "com.nuvio.directplayer",
-        version: "1.0.6",
+        version: "1.0.7",
         name: "Direct Video Player",
         description: "Play direct video links with automatic episode metadata",
         resources: ["catalog", "meta", "stream"],
