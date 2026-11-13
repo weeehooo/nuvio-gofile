@@ -63,6 +63,12 @@ function normalize(value) {
     .replace(/[^a-z0-9]/g, "");
 }
 
+function exactMatch(a, b) {
+  const first = normalize(a);
+  const second = normalize(b);
+  return first.length > 0 && first === second;
+}
+
 function parseFilename(filename) {
   let name = filename.replace(/\.[^.]+$/, "");
 
@@ -118,13 +124,6 @@ function displayTitle(title, info) {
   }
 
   return title;
-}
-
-function exactMatch(info, title) {
-  const wanted = normalize(info);
-  const candidate = normalize(title);
-
-  return wanted.length > 0 && candidate === wanted;
 }
 
 async function fetchAnime(title) {
@@ -196,13 +195,77 @@ async function fetchAnime(title) {
   }
 }
 
-async function fetchCinemeta(title, type) {
-  const key = `${type}:${title}`;
+async function fetchSeries(title, info) {
+  const key = `series:${title}:${info.season}:${info.episode}`;
+  if (cache.has(key)) return cache.get(key);
+
+  try {
+    const searchUrl =
+      `https://v3-cinemeta.strem.io/catalog/series/top/search=${encodeURIComponent(title)}.json`;
+
+    const searchResponse = await fetch(searchUrl, {
+      signal: AbortSignal.timeout(6000)
+    });
+
+    if (!searchResponse.ok) return null;
+
+    const searchData = await searchResponse.json();
+    const metas = searchData?.metas || [];
+
+    const match = metas.find(item => exactMatch(title, item.name));
+
+    if (!match) return null;
+
+    const metaUrl =
+      `https://v3-cinemeta.strem.io/meta/series/${encodeURIComponent(match.id)}.json`;
+
+    const metaResponse = await fetch(metaUrl, {
+      signal: AbortSignal.timeout(6000)
+    });
+
+    if (!metaResponse.ok) return null;
+
+    const metaData = await metaResponse.json();
+    const series = metaData?.meta;
+
+    if (!series) return null;
+
+    let episode = null;
+
+    if (info.season !== null && info.episode !== null) {
+      episode = (series.videos || []).find(video =>
+        Number(video.season) === info.season &&
+        Number(video.episode) === info.episode
+      );
+    }
+
+    const result = {
+      name: series.name || title,
+      poster: series.poster || undefined,
+      background: series.background || undefined,
+      description: series.description || "",
+      releaseInfo: series.releaseInfo || undefined,
+      genres: series.genres || [],
+      episodeName: episode?.title || null,
+      episodeDescription: episode?.overview || null,
+      episodeImage: episode?.thumbnail || null,
+      episodeReleased: episode?.released || null
+    };
+
+    cache.set(key, result);
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchMovie(title) {
+  const key = "movie:" + title;
   if (cache.has(key)) return cache.get(key);
 
   try {
     const endpoint =
-      `https://v3-cinemeta.strem.io/catalog/${type}/top/search=${encodeURIComponent(title)}.json`;
+      `https://v3-cinemeta.strem.io/catalog/movie/top/search=${encodeURIComponent(title)}.json`;
 
     const response = await fetch(endpoint, {
       signal: AbortSignal.timeout(6000)
@@ -213,9 +276,7 @@ async function fetchCinemeta(title, type) {
     const data = await response.json();
     const metas = data?.metas || [];
 
-    const match = metas.find(item =>
-      exactMatch(title, item.name)
-    );
+    const match = metas.find(item => exactMatch(title, item.name));
 
     if (!match) return null;
 
@@ -244,6 +305,32 @@ async function getMetadata(videoUrl) {
     description: `Original file: ${filename}`
   };
 
+  // Series and episode lookup
+  const series = await fetchSeries(info.title, info);
+
+  if (series) {
+    const hasEpisode = Boolean(series.episodeName);
+
+    return {
+      name: hasEpisode
+        ? `${series.name} - ${series.episodeName}`
+        : displayTitle(series.name, info),
+
+      poster: series.episodeImage || series.poster,
+      background: series.background,
+
+      description: hasEpisode && series.episodeDescription
+        ? series.episodeDescription
+        : series.description || fallback.description,
+
+      releaseInfo: series.episodeReleased
+        ? series.episodeReleased.slice(0, 4)
+        : series.releaseInfo,
+
+      genres: series.genres || []
+    };
+  }
+
   // Anime lookup
   const anime = await fetchAnime(info.title);
 
@@ -255,29 +342,11 @@ async function getMetadata(videoUrl) {
     };
   }
 
-  // TV series lookup
-  const series = await fetchCinemeta(info.title, "series");
-
-  if (series) {
-    return {
-      ...series,
-      name: displayTitle(series.name, info),
-      description: `${fallback.name}\n\n${series.description}`
-    };
-  }
-
   // Movie lookup
-  const movie = await fetchCinemeta(info.title, "movie");
+  const movie = await fetchMovie(info.title);
 
-  if (movie) {
-    return {
-      ...movie,
-      name: movie.name,
-      description: movie.description
-    };
-  }
+  if (movie) return movie;
 
-  // No reliable match: use original filename
   return fallback;
 }
 
@@ -294,9 +363,9 @@ export default {
     if (path === "/manifest.json") {
       return json({
         id: "com.nuvio.directplayer",
-        version: "1.0.5",
+        version: "1.0.6",
         name: "Direct Video Player",
-        description: "Play direct video links with automatic metadata",
+        description: "Play direct video links with automatic episode metadata",
         resources: ["catalog", "meta", "stream"],
         types: ["movie"],
         idPrefixes: ["direct:"],
