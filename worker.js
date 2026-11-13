@@ -5,6 +5,8 @@ const cors = {
 };
 
 const cache = new Map();
+const TMDB_LANGUAGE = "ar-SA";
+const TMDB_IMAGE = "https://image.tmdb.org/t/p/original";
 
 function json(data) {
   return new Response(JSON.stringify(data), { headers: cors });
@@ -57,10 +59,10 @@ function getFilename(videoUrl) {
 
 function normalize(value) {
   return (value || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
+    .normalize("NFKC")
     .toLowerCase()
-    .replace(/[^a-z0-9]/g, "");
+    .replace(/\p{M}/gu, "")
+    .replace(/[^\p{L}\p{N}]/gu, "");
 }
 
 function exactMatch(a, b) {
@@ -124,6 +126,126 @@ function displayTitle(title, info) {
   }
 
   return title;
+}
+
+async function tmdbFetch(endpoint, token) {
+  if (!token) return null;
+
+  try {
+    const response = await fetch(
+      `https://api.themoviedb.org/3${endpoint}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json"
+        },
+        signal: AbortSignal.timeout(8000)
+      }
+    );
+
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+function tmdbImage(path) {
+  return path ? `${TMDB_IMAGE}${path}` : undefined;
+}
+
+async function fetchTMDBSeries(title, info, token) {
+  const key = `tmdb-series:${title}:${info.season}:${info.episode}`;
+
+  if (cache.has(key)) return cache.get(key);
+
+  const search = await tmdbFetch(
+    `/search/tv?query=${encodeURIComponent(title)}&language=${TMDB_LANGUAGE}&include_adult=false`,
+    token
+  );
+
+  const results = search?.results || [];
+
+  const match = results.find(item =>
+    exactMatch(title, item.name) ||
+    exactMatch(title, item.original_name)
+  );
+
+  if (!match) return null;
+
+  const details = await tmdbFetch(
+    `/tv/${match.id}?language=${TMDB_LANGUAGE}`,
+    token
+  );
+
+  if (!details) return null;
+
+  let episode = null;
+
+  if (info.season !== null && info.episode !== null) {
+    episode = await tmdbFetch(
+      `/tv/${match.id}/season/${info.season}/episode/${info.episode}?language=${TMDB_LANGUAGE}`,
+      token
+    );
+  }
+
+  const result = {
+    name: details.name || match.name || title,
+    poster: tmdbImage(details.poster_path || match.poster_path),
+    background: tmdbImage(details.backdrop_path || match.backdrop_path),
+    description: details.overview || match.overview || "",
+    releaseInfo: details.first_air_date
+      ? details.first_air_date.slice(0, 4)
+      : undefined,
+    genres: (details.genres || []).map(g => g.name),
+    episodeName: episode?.name || null,
+    episodeDescription: episode?.overview || null,
+    episodeReleased: episode?.air_date || null
+  };
+
+  cache.set(key, result);
+  return result;
+}
+
+async function fetchTMDBMovie(title, token) {
+  const key = `tmdb-movie:${title}`;
+
+  if (cache.has(key)) return cache.get(key);
+
+  const search = await tmdbFetch(
+    `/search/movie?query=${encodeURIComponent(title)}&language=${TMDB_LANGUAGE}&include_adult=false`,
+    token
+  );
+
+  const results = search?.results || [];
+
+  const match = results.find(item =>
+    exactMatch(title, item.title) ||
+    exactMatch(title, item.original_title)
+  );
+
+  if (!match) return null;
+
+  const details = await tmdbFetch(
+    `/movie/${match.id}?language=${TMDB_LANGUAGE}`,
+    token
+  );
+
+  if (!details) return null;
+
+  const result = {
+    name: details.title || match.title || title,
+    poster: tmdbImage(details.poster_path || match.poster_path),
+    background: tmdbImage(details.backdrop_path || match.backdrop_path),
+    description: details.overview || match.overview || "",
+    releaseInfo: details.release_date
+      ? details.release_date.slice(0, 4)
+      : undefined,
+    genres: (details.genres || []).map(g => g.name)
+  };
+
+  cache.set(key, result);
+  return result;
 }
 
 async function fetchAnime(title) {
@@ -296,7 +418,7 @@ async function fetchMovie(title) {
   }
 }
 
-async function getMetadata(videoUrl) {
+async function getMetadata(videoUrl, token) {
   const filename = getFilename(videoUrl);
   const info = parseFilename(filename);
 
@@ -305,7 +427,33 @@ async function getMetadata(videoUrl) {
     description: `Original file: ${filename}`
   };
 
-  // Series and episode lookup
+  // Arabic TV and anime metadata from TMDB
+  const tmdbSeries = await fetchTMDBSeries(info.title, info, token);
+
+  if (tmdbSeries) {
+    const hasEpisode = Boolean(tmdbSeries.episodeName);
+
+    return {
+      name: hasEpisode
+        ? `${tmdbSeries.name} - ${tmdbSeries.episodeName}`
+        : displayTitle(tmdbSeries.name, info),
+
+      poster: tmdbSeries.poster,
+      background: tmdbSeries.background,
+
+      description: hasEpisode && tmdbSeries.episodeDescription
+        ? tmdbSeries.episodeDescription
+        : tmdbSeries.description || fallback.description,
+
+      releaseInfo: tmdbSeries.episodeReleased
+        ? tmdbSeries.episodeReleased.slice(0, 4)
+        : tmdbSeries.releaseInfo,
+
+      genres: tmdbSeries.genres || []
+    };
+  }
+
+  // Original series metadata fallback
   const series = await fetchSeries(info.title, info);
 
   if (series) {
@@ -316,7 +464,6 @@ async function getMetadata(videoUrl) {
         ? `${series.name} - ${series.episodeName}`
         : displayTitle(series.name, info),
 
-      // Always use the series poster, not the episode thumbnail.
       poster: series.poster,
       background: series.background,
 
@@ -332,7 +479,7 @@ async function getMetadata(videoUrl) {
     };
   }
 
-  // Anime lookup
+  // Anime fallback
   const anime = await fetchAnime(info.title);
 
   if (anime) {
@@ -343,7 +490,12 @@ async function getMetadata(videoUrl) {
     };
   }
 
-  // Movie lookup
+  // Arabic movie metadata from TMDB
+  const tmdbMovie = await fetchTMDBMovie(info.title, token);
+
+  if (tmdbMovie) return tmdbMovie;
+
+  // Original movie metadata fallback
   const movie = await fetchMovie(info.title);
 
   if (movie) return movie;
@@ -352,7 +504,7 @@ async function getMetadata(videoUrl) {
 }
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -360,20 +512,22 @@ export default {
       return new Response(null, { headers: cors });
     }
 
+    const token = env.TMDB_TOKEN;
+
     // Manifest
     if (path === "/manifest.json") {
       return json({
         id: "com.nuvio.directplayer",
-        version: "1.0.7",
+        version: "1.0.8",
         name: "Direct Video Player",
-        description: "Play direct video links with automatic episode metadata",
+        description: "تشغيل روابط الفيديو المباشرة مع بيانات عربية تلقائية",
         resources: ["catalog", "meta", "stream"],
         types: ["movie"],
         idPrefixes: ["direct:"],
         catalogs: [{
           type: "movie",
           id: "direct",
-          name: "Direct Video Player",
+          name: "مشغل الفيديو المباشر",
           extra: [{
             name: "search",
             isRequired: true
@@ -394,7 +548,7 @@ export default {
       if (!validUrl(input)) return json({ metas: [] });
 
       const id = "direct:" + encodeId(input);
-      const metadata = await getMetadata(input);
+      const metadata = await getMetadata(input, token);
 
       return json({
         metas: [{
@@ -427,7 +581,7 @@ export default {
 
       if (!validUrl(videoUrl)) return json({ meta: null });
 
-      const metadata = await getMetadata(videoUrl);
+      const metadata = await getMetadata(videoUrl, token);
 
       return json({
         meta: {
